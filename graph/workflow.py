@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from langchain_deepseek import ChatDeepSeek
 from langchain_core.tools import tool
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from .state import State
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.checkpoint.memory import MemorySaver
@@ -20,7 +20,7 @@ class TravelInfo(BaseModel):
     travel_intent: str = Field(default="new")
 
 model = ChatDeepSeek(
-    model="deepseek-v4-pro",
+    model="deepseek-flash",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url=os.getenv("DEEPSEEK_API_URL"),
     temperature=0.7,
@@ -234,7 +234,17 @@ def planner(state: State):
                 f"城市：{old_city or '未指定'}\n"
                 f"开始日期：{old_start_date or '未指定'}\n"
                 f"旅行天数：{old_days or '未指定'}\n\n"
-                "如果用户只是打招呼、闲聊，或者与旅行无关，"
+                              "请判断用户最新消息属于哪一类：\n"
+                "1. 新的旅行计划（travel_intent=new）：提出一个与之前无关的新目的地/新行程。\n"
+                "2. 修改已有计划（travel_intent=update）：在之前计划的基础上，"
+                "改城市、日期、天数或行程安排。\n"
+                "3. 提问或闲聊（travel_intent=chat）：询问、评价、确认之前已经生成的行程细节，"
+                "比如“第一天会不会太赶”“那边天气怎么样”“需要带什么”，或者只是打招呼。\n\n"
+                
+                "属于第 1、2 类时，is_travel_request=true；"
+                "属于第 3 类时，is_travel_request=false。\n"
+                "仅仅提到旅行、行程、景点，并不代表用户要新建或修改计划，"
+                "关键要看用户是在“提问”还是在“提出/修改需求”。\n"  "如果用户只是打招呼、闲聊，或者与旅行无关，"
                 "请将 is_travel_request 设置为 false。\n"
                 "如果用户正在提出旅行需求，或者修改、补充之前的旅行需求，"
                 "请将 is_travel_request 设置为 true。\n"
@@ -268,9 +278,12 @@ def planner(state: State):
     print("===== Planner =====")
     print(response)
 
-    city = old_city
-    start_date = old_start_date
-    days = old_days
+    if response.travel_intent == "new":
+        # 全新计划：不继承上一轮的信息
+        city, start_date, days = "", "", 0
+    else:
+        # 补充/修改：以旧值为底，新值覆盖
+        city, start_date, days = old_city, old_start_date, old_days
 
     if response.city:
         city = response.city
@@ -281,14 +294,28 @@ def planner(state: State):
     if response.days > 0:
         days = response.days
 
+        # 关键：plan 必须用“合并后”的值，否则 synthesizer 拿到的是空字段
+    plan_info = TravelInfo(
+        city=city,
+        start_date=start_date,
+        days=days,
+        is_travel_request=response.is_travel_request,
+        travel_intent=response.travel_intent,
+    )
+
     return {
         "city": city,
         "start_date": start_date,
         "days": days,
-        "plan": str(response),
+        "plan": str(plan_info),
         "is_travel_request": response.is_travel_request,
         "travel_intent": response.travel_intent,
-        "results": ""
+        "results": "",
+        # 每轮重新开始：清空上一轮的工具结果和轮数。
+        # 否则模型这轮没调工具时，synthesizer 会拿到上一个城市的天气。
+        "weather": "",
+        "attractions": "",
+        "tool_rounds": 0,
     }
 # =========================
 # 检查旅行需求是否完整
@@ -318,15 +345,24 @@ def check_requirements(state:State):
 def normal_chat(state: State):
     print("===== Normal Chat =====")
 
-    response = model.invoke(
-        state["messages"]
-    )
+    messages = [
+        SystemMessage(
+            content=(
+                "你是旅行助手。用户是在追问、评价或确认之前已经生成的行程时，"
+                "请结合对话历史直接回答，不要重新生成整篇攻略，"
+                "也不要重复罗列全部日期安排。"
+            )
+        )
+    ]
+    messages.extend(state["messages"])
 
-    print("===== Normal Chat 回复 =====")
-    print(response.content)
+    response = model.invoke(messages)
 
     return {
-        "normal_reply": response.content
+        "normal_reply": response.content,
+        # 关键：把模型自己的回复写回 messages，
+        # 下一轮 normal_chat / planner 才看得到“我上一轮说了什么”
+        "messages": [response],
     }
 # =========================
 #  请求用户补充信息
@@ -343,7 +379,9 @@ def ask_user(state:State):
     for item in missing:
         message+=f"- {item}\n"
     return {
-        "results":message
+        "results": message,
+        # 追问也是助手说过的话，写回 messages 才能让下一轮有上下文
+        "messages": [AIMessage(content=message)],
     }
 # =========================
 #  条件路由
@@ -365,37 +403,49 @@ def requirements_router(state: State):
     print("→ executor")
     return "executor"
 
+def _tool_messages_this_turn(messages):
+    """只返回最后一条用户消息之后的 ToolMessage。
+
+    不能扫描全部历史：历史里还留着上一轮北京的工具结果，
+    这轮只查了上海景点时，会把北京的天气当成上海的。
+    """
+    start = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].type == "human":
+            start = i + 1
+            break
+    return messages[start:]
 
 # =========================
 #  保存工具调用结果
 # =========================
 def save_tool_results(state: State):
-
     weather = ""
     attractions = ""
 
-    for msg in state["messages"]:
+    for msg in _tool_messages_this_turn(state["messages"]):
+        if msg.type != "tool":
+            continue
 
-        if msg.type == "tool":
+        if msg.name == "get_weather":
+            weather = msg.content
 
-            if msg.name == "get_weather":
-                weather = msg.content
+        elif msg.name == "search_attractions":
+            attractions = msg.content
 
-            elif msg.name == "search_attractions":
-                attractions = msg.content
+    rounds = state.get("tool_rounds", 0) + 1
 
-    print("===== Save Tool Results =====")
+    print(f"===== Save Tool Results (round {rounds}) =====")
     print("天气：")
     print(weather)
-
     print("景点：")
     print(attractions)
 
     return {
         "weather": weather,
-        "attractions": attractions
+        "attractions": attractions,
+        "tool_rounds": rounds,
     }
-
 def update_travel(state: State):
     print("===== Update Travel =====")
     print("正在更新旅行计划")
@@ -420,46 +470,67 @@ def executor_router(state: State):
 
     print("→ synthesizer")
     return "synthesizer"
+# 一轮对话里最多执行几轮工具调用；超过就不再给模型工具，逼它总结
+MAX_TOOL_ROUNDS = 3
+
+
 def executor(state: State):
+    rounds = state.get("tool_rounds", 0)
+    use_tools = rounds < MAX_TOOL_ROUNDS
 
-    messages = [
-        SystemMessage(
-            content=(
-                "你是一个旅行执行助手。\n"
-                "请根据旅行计划执行旅行相关的信息查询任务。\n\n"
+    system_content = (
+        "你是一个旅行执行助手。\n"
+        "请根据旅行计划执行旅行相关的信息查询任务。\n\n"
 
-                "【必须完成的任务】\n"
-                "1. 必须调用 get_weather 工具查询旅行期间的天气。\n"
-                "2. 必须调用 search_attractions 工具查询目的地的热门旅游景点。\n\n"
+        "【必须完成的任务】\n"
+        "1. 必须调用 get_weather 工具查询旅行期间的天气。\n"
+        "2. 必须调用 search_attractions 工具查询目的地的热门旅游景点。\n\n"
 
-                "【天气工具】\n"
-                "天气工具所需要的参数已经保存在 State 中。\n"
-                "不要自己猜测或修改这些参数。\n"
-                f"城市：{state['city']}\n"
-                f"旅行开始日期：{state['start_date']}\n"
-                f"旅行天数：{state['days']}\n\n"
+        "【天气工具】\n"
+        "天气工具所需要的参数已经保存在 State 中。\n"
+        "不要自己猜测或修改这些参数。\n"
+        f"城市：{state['city']}\n"
+        f"旅行开始日期：{state['start_date']}\n"
+        f"旅行天数：{state['days']}\n\n"
 
-                "调用 get_weather 时，必须使用上面的城市、开始日期和旅行天数。\n"
-                "不要自己编造天气信息。\n\n"
+        "调用 get_weather 时，必须使用上面的城市、开始日期和旅行天数。\n"
+        "不要自己编造天气信息。\n\n"
 
-                "【景点工具】\n"
-                "调用 search_attractions 时，必须使用 State 中的城市。\n"
-                f"景点查询城市：{state['city']}\n"
-                "不要自己编造景点查询结果。\n\n"
+        "【景点工具】\n"
+        "调用 search_attractions 时，必须使用 State 中的城市。\n"
+        f"景点查询城市：{state['city']}\n"
+        "不要自己编造景点查询结果。\n\n"
 
-                "请先完成必要的信息查询，再根据工具返回的结果进行整理。"
-            )
-        ),
-        HumanMessage(
-            content=state["plan"]
+        # 计划放进 system，而不是再塞一条 HumanMessage，
+        # 避免出现“两条连续用户消息”干扰模型
+        f"【本轮旅行计划】\n{state['plan']}\n\n"
+
+        "请先完成必要的信息查询，再根据工具返回的结果进行整理。"
+    )
+
+    if rounds > 0:
+        # 第二轮起，已经拿到部分结果时，鼓励直接总结，减少无意义的重复调用
+        system_content += (
+            "\n\n【注意】本轮之前已经调用过工具。"
+            "如果信息已经足够，请不要再调用工具，直接整理结果。"
         )
-    ]
 
-    # 把之前的 AI 工具调用和 ToolMessage
-    # 一起交给模型
+    if not use_tools:
+        system_content += (
+            f"\n\n【重要】本轮已经达到 {MAX_TOOL_ROUNDS} 轮工具调用上限，"
+            "工具已被禁用，请直接根据已有的工具结果完成总结，不要声称还要查询。"
+        )
+
+    # 只保留 system + 完整对话历史（plan 已经在 system 里）
+    messages = [SystemMessage(content=system_content)]
     messages.extend(state["messages"])
 
-    response = model_with_tools.invoke(messages)
+    llm = model_with_tools if use_tools else model
+
+    if not use_tools:
+        print(f"===== Executor: 已达工具轮数上限 {MAX_TOOL_ROUNDS}，强制总结 =====")
+
+    response = llm.invoke(messages)
 
     print("===== Executor =====")
     print(response)
@@ -468,10 +539,8 @@ def executor(state: State):
 
     return {
         "messages": [response],
-        "results": ""
+        "results": "",
     }
-
-
 # =========================
 # Synthesizer
 # =========================
@@ -518,10 +587,9 @@ def synthesizer(state: State):
     print("===== Synthesizer 生成结果 =====")
     print(response.content)
     return {
-        "city": state["city"],
-        "start_date": state["start_date"],
-        "days": state["days"],
-        "results": response.content
+        "results": response.content,
+        # 最终攻略写回 messages：用户的下一句追问才能引用它
+        "messages": [response],
     }
 
 
