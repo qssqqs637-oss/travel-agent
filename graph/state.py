@@ -15,3 +15,5 @@ class State(TypedDict):
     normal_reply: str
     travel_intent: str
     tool_rounds: int          # 新增：本轮已经执行过几轮工具
+    date_error: str           # 新增：日期不合法的原因，用于追问时提示用户
+    itinerary: dict           # 新增：结构化行程（给前端卡片渲染）

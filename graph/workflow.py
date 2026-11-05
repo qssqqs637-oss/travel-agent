@@ -1,16 +1,39 @@
 import os
 import json
+import sqlite3
+import requests
+import time
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
-from langchain_deepseek import ChatDeepSeek
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from .state import State
-from langgraph.prebuilt import ToolNode, tools_condition
-from langgraph.checkpoint.memory import MemorySaver
+from .llm import build_model
+from .utils import (
+    format_driving,
+    merge_travel_info,
+    normalize_budget,
+    normalize_temps,
+    recent_messages,
+    today_cn,
+)
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.sqlite import SqliteSaver
 from pydantic import BaseModel, Field
-import requests
 load_dotenv()
+
+GUIDE_MAX_TOKENS = int(os.getenv("GUIDE_MAX_TOKENS", "1200"))
+AMAP_API_KEY = os.getenv("AMAP_API_KEY", "").strip()
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "8"))
+POI_CACHE: dict[tuple[str, str], str] = {}
+
+print(
+    "[amap] enabled"
+    if AMAP_API_KEY
+    else "[amap] disabled, using built-in attractions"
+)
+
 
 class TravelInfo(BaseModel):
     city: str = Field(default="")
@@ -18,15 +41,64 @@ class TravelInfo(BaseModel):
     days: int = Field(default=0)
     is_travel_request: bool = Field(default=False)
     travel_intent: str = Field(default="new")
+    keep_previous: bool = Field(default=False)
 
-model = ChatDeepSeek(
-    model="deepseek-flash",
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url=os.getenv("DEEPSEEK_API_URL"),
-    temperature=0.7,
+
+class PlanItem(BaseModel):
+    time: str = Field(default="")
+    title: str = Field(default="")
+    description: str = Field(default="")
+    travel_from_previous: str = Field(default="")
+
+
+class DayPlan(BaseModel):
+    date: str = Field(default="")
+    weekday: str = Field(default="")
+    weather: str = Field(default="")
+    theme: str = Field(default="")
+    items: list[PlanItem] = Field(default_factory=list)
+    notes: str = Field(default="")
+
+
+class BudgetItem(BaseModel):
+    category: str = Field(default="")
+    amount: str = Field(default="")
+    note: str = Field(default="")
+
+
+class Budget(BaseModel):
+    currency: str = Field(default="CNY")
+    per_person: str = Field(default="")
+    total: str = Field(default="")
+    items: list[BudgetItem] = Field(default_factory=list)
+    note: str = Field(default="")
+
+
+class Itinerary(BaseModel):
+    city: str = Field(default="")
+    start_date: str = Field(default="")
+    days: int = Field(default=0)
+    summary: str = Field(default="")
+    day_plans: list[DayPlan] = Field(default_factory=list)
+    tips: list[str] = Field(default_factory=list)
+    budget: Budget | None = None
+
+model = build_model()
+guide_model = model.bind(max_tokens=GUIDE_MAX_TOKENS)
+# 百炼部分模型不支持 response_format 的结构化输出，默认走函数调用
+STRUCTURED_METHOD = os.getenv("STRUCTURED_METHOD", "function_calling")
+# 让模型直接产出 TravelInfo，不再自己解析 JSON 文本
+structured_planner = model.with_structured_output(
+    TravelInfo, include_raw=True, method=STRUCTURED_METHOD
 )
-
-
+# 把 Markdown 攻略整理成结构化行程
+structured_itinerary = model.with_structured_output(
+    Itinerary, include_raw=True, method=STRUCTURED_METHOD
+)
+# 单日重排：只生成一个 DayPlan
+structured_day = model.with_structured_output(
+    DayPlan, include_raw=True, method=STRUCTURED_METHOD
+)
 # =========================
 # 1. 天气工具
 # =========================
@@ -66,17 +138,21 @@ def get_weather(city: str, start_date: str, days: int):
 
     geo_url = "https://geocoding-api.open-meteo.com/v1/search"
 
-    geo_response = requests.get(
-        geo_url,
-        params={
-            "name": city,
-            "count": 1,
-            "language": "zh",
-            "format": "json"
-        }
-    )
-
-    geo_data = geo_response.json()
+    try:
+        geo_response = requests.get(
+            geo_url,
+            params={
+                "name": city,
+                "count": 1,
+                "language": "zh",
+                "format": "json"
+            },
+            timeout=10,
+        )
+        geo_response.raise_for_status()
+        geo_data = geo_response.json()
+    except requests.RequestException as exc:
+        return f"天气查询失败：{exc}"
 
     if "results" not in geo_data:
         return f"找不到城市：{city}"
@@ -88,13 +164,20 @@ def get_weather(city: str, start_date: str, days: int):
     # 计算结束日期
     # =========================
 
-    from datetime import datetime, timedelta
-
-    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    except ValueError:
+        return f"日期格式不正确：{start_date}"
 
     end = start + timedelta(days=days - 1)
-
     end_date = end.strftime("%Y-%m-%d")
+
+    today = today_cn()
+    if (start - today).days < 0 or (end - today).days > 15:
+        return (
+            f"{city}的天气预报只支持未来 15 天，"
+            f"{start_date} 至 {end_date} 暂时查不到。"
+        )
 
     # =========================
     # 查询天气
@@ -102,22 +185,23 @@ def get_weather(city: str, start_date: str, days: int):
 
     weather_url = "https://api.open-meteo.com/v1/forecast"
 
-    weather_response = requests.get(
-        weather_url,
-        params={
-            "latitude": latitude,
-            "longitude": longitude,
-
-            "start_date": start_date,
-            "end_date": end_date,
-
-            "daily": "temperature_2m_max,temperature_2m_min,weather_code",
-
-            "timezone": "Asia/Shanghai"
-        }
-    )
-
-    weather_data = weather_response.json()
+    try:
+        weather_response = requests.get(
+            weather_url,
+            params={
+                "latitude": latitude,
+                "longitude": longitude,
+                "start_date": start_date,
+                "end_date": end_date,
+                "daily": "temperature_2m_max,temperature_2m_min,weather_code",
+                "timezone": "Asia/Shanghai",
+            },
+            timeout=10,
+        )
+        weather_response.raise_for_status()
+        weather_data = weather_response.json()
+    except requests.RequestException as exc:
+        return f"天气查询失败：{exc}"
 
     # =========================
     # 检查 API 是否返回错误
@@ -142,7 +226,7 @@ def get_weather(city: str, start_date: str, days: int):
 
     for i in range(len(daily["time"])):
 
-        date = daily["time"][i]
+        day = daily["time"][i]
 
         max_temp = daily["temperature_2m_max"][i]
         min_temp = daily["temperature_2m_min"][i]
@@ -152,7 +236,7 @@ def get_weather(city: str, start_date: str, days: int):
         weather_text = weather_code_to_text(weather_code)
 
         result += (
-            f"{date}："
+            f"{day}："
             f"{weather_text}，"
             f"{min_temp}°C ~ {max_temp}°C\n"
         )
@@ -160,45 +244,214 @@ def get_weather(city: str, start_date: str, days: int):
     return result
 
 
- # 景点工具
+# 景点工具
+_FALLBACK_ATTRACTIONS = {
+    "北京": [
+        "故宫",
+        "天安门广场",
+        "颐和园",
+        "天坛",
+        "八达岭长城"
+    ],
+    "上海": [
+        "外滩",
+        "东方明珠",
+        "豫园",
+        "上海博物馆",
+        "迪士尼乐园"
+    ],
+    "杭州": [
+        "西湖",
+        "灵隐寺",
+        "西溪湿地",
+        "雷峰塔",
+        "宋城"
+    ]
+}
+
+
+def _fallback_attractions(city: str) -> str:
+    items = _FALLBACK_ATTRACTIONS.get(city)
+    if not items:
+        return f"暂时没有找到 {city} 的景点信息。"
+    return f"{city}热门旅游景点：\n" + "\n".join(
+        f"- {item}" for item in items
+    )
+
+
 @tool
 def search_attractions(city: str):
-    """
-    查询指定城市的热门旅游景点。
-    """
-    # 暂时先用固定数据测试 Tool Calling
-    attractions = {
-        "北京": [
-            "故宫",
-            "天安门广场",
-            "颐和园",
-            "天坛",
-            "八达岭长城"
-        ],
-        "上海": [
-            "外滩",
-            "东方明珠",
-            "豫园",
-            "上海博物馆",
-            "迪士尼乐园"
-        ],
-        "杭州": [
-            "西湖",
-            "灵隐寺",
-            "西溪湿地",
-            "雷峰塔",
-            "宋城"
-        ]
-    }
+    """查询指定城市的热门旅游景点。"""
+    if not AMAP_API_KEY:
+        return _fallback_attractions(city)
 
-    result = attractions.get(city)
+    url = "https://restapi.amap.com/v3/place/text"
 
-    if not result:
-        return f"暂时没有找到 {city} 的景点信息。"
+    try:
+        response = requests.get(
+            url,
+            params={
+                "key": AMAP_API_KEY,
+                "city": city,
+                "citylimit": "true",
+                "types": "110000|140100",  # 风景名胜 + 博物馆
+                "offset": 10,
+                "page": 1,
+                "extensions": "all",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        print("高德景点查询失败:", exc)
+        return _fallback_attractions(city)
 
-    return f"{city}热门旅游景点：\n" + "\n".join(
-        f"- {item}" for item in result
-    )
+    if str(data.get("status")) != "1":
+        print("高德景点查询返回错误:", data.get("info"))
+        return _fallback_attractions(city)
+
+    pois = data.get("pois") or []
+    if not isinstance(pois, list) or not pois:
+        return _fallback_attractions(city)
+
+    lines = [f"{city}热门旅游景点："]
+    seen = set()
+
+    for poi in pois:
+        name = (poi.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+
+        location = poi.get("location")
+        if location:
+            POI_CACHE[(city, name)] = location
+
+        address = poi.get("address") or ""
+        if isinstance(address, list):
+            address = "".join(address)
+
+        biz_ext = poi.get("biz_ext") or {}
+        rating = ""
+        if isinstance(biz_ext, dict):
+            rating = biz_ext.get("rating") or ""
+
+        detail = name
+        if address:
+            detail += f"（{address}）"
+        if rating:
+            detail += f" 评分 {rating}"
+
+        lines.append(f"- {detail}")
+
+        if len(lines) > 8:
+            break
+
+    if len(lines) == 1:
+        return _fallback_attractions(city)
+
+    return "\n".join(lines)
+
+
+def _lookup_location(title, city):
+    """按景点名找坐标：先查缓存，再查高德。"""
+    if not title:
+        return None
+
+    cached = POI_CACHE.get((city, title))
+    if cached:
+        return cached
+
+    for (cached_city, name), location in POI_CACHE.items():
+        if cached_city != city:
+            continue
+        if title in name or name in title:
+            return location
+
+    if not AMAP_API_KEY:
+        return None
+
+    try:
+        response = requests.get(
+            "https://restapi.amap.com/v3/place/text",
+            params={
+                "key": AMAP_API_KEY,
+                "keywords": title,
+                "city": city,
+                "citylimit": "true",
+                "offset": 1,
+                "page": 1,
+                "extensions": "base",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        print("景点坐标查询失败:", title, exc)
+        return None
+
+    if str(data.get("status")) != "1":
+        return None
+
+    pois = data.get("pois") or []
+    if not isinstance(pois, list) or not pois:
+        return None
+
+    location = pois[0].get("location")
+    if location:
+        POI_CACHE[(city, title)] = location
+    return location
+
+
+def _driving_info(origin, destination):
+    """返回 '车程 25 分钟 / 8.2 公里'，失败返回空字符串。"""
+    if not AMAP_API_KEY:
+        return ""
+
+    try:
+        response = requests.get(
+            "https://restapi.amap.com/v3/direction/driving",
+            params={
+                "key": AMAP_API_KEY,
+                "origin": origin,
+                "destination": destination,
+                "extensions": "base",
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        print("路径规划失败:", exc)
+        return ""
+
+    if str(data.get("status")) != "1":
+        return ""
+
+    paths = (data.get("route") or {}).get("paths") or []
+    if not paths:
+        return ""
+
+    path = paths[0]
+    return format_driving(path.get("distance"), path.get("duration"))
+
+
+_GENERIC_TITLE_WORDS = (
+    "自由活动",
+    "自由安排",
+    "休息",
+    "返程",
+    "用餐",
+    "入住",
+    "退房",
+)
+
+
+def _is_generic_title(title):
+    return any(word in title for word in _GENERIC_TITLE_WORDS)
+
 
 # =========================
 # 2. 给模型绑定工具
@@ -214,7 +467,7 @@ tool_node = ToolNode([get_weather,search_attractions])
 # =========================
 
 def planner(state: State):
-
+    today = today_cn()
     print("===== Planner 收到的 State =====")
     print("city =", state.get("city"))
     print("start_date =", state.get("start_date"))
@@ -224,7 +477,7 @@ def planner(state: State):
     old_start_date = state.get("start_date") or ""
     old_days = state.get("days") or 0
 
-    response = model.invoke([
+    raw_result = structured_planner.invoke([
         SystemMessage(
             content=(
                 "你是一个旅行需求信息提取器。\n"
@@ -234,7 +487,7 @@ def planner(state: State):
                 f"城市：{old_city or '未指定'}\n"
                 f"开始日期：{old_start_date or '未指定'}\n"
                 f"旅行天数：{old_days or '未指定'}\n\n"
-                              "请判断用户最新消息属于哪一类：\n"
+                "请判断用户最新消息属于哪一类：\n"
                 "1. 新的旅行计划（travel_intent=new）：提出一个与之前无关的新目的地/新行程。\n"
                 "2. 修改已有计划（travel_intent=update）：在之前计划的基础上，"
                 "改城市、日期、天数或行程安排。\n"
@@ -244,57 +497,50 @@ def planner(state: State):
                 "属于第 1、2 类时，is_travel_request=true；"
                 "属于第 3 类时，is_travel_request=false。\n"
                 "仅仅提到旅行、行程、景点，并不代表用户要新建或修改计划，"
-                "关键要看用户是在“提问”还是在“提出/修改需求”。\n"  "如果用户只是打招呼、闲聊，或者与旅行无关，"
-                "请将 is_travel_request 设置为 false。\n"
-                "如果用户正在提出旅行需求，或者修改、补充之前的旅行需求，"
-                "请将 is_travel_request 设置为 true。\n"
-                "如果用户是在创建新的旅行计划，"
-                "请将 travel_intent 设置为 new。\n"
-                "如果用户是在修改、调整之前已经存在的旅行计划，"
-                "请将 travel_intent 设置为 update。\n"
-                "如果用户只是普通聊天，"
-                "请将 travel_intent 设置为 chat。\n"
+                "关键要看用户是在“提问”还是在“提出/修改需求”。\n"
+                "如果用户只是报了一个新城市（例如“上海”），没有提到日期或天数，"
+                "也没有说“还是之前的时间”，请按新计划处理，travel_intent=new，"
+                "keep_previous=false，不要默认沿用上一轮的时间。\n"
+                "只有当用户明确说“还是这三天”“日期不变”“同样的时间”等，"
+                "才把 keep_previous 设置为 true。\n"
                 "如果用户最新消息没有提供某个信息，"
                 "请返回空字符串或 0，不要编造。\n"
 
                 "开始日期请转换成 YYYY-MM-DD 格式。\n"
                 "如果用户使用“9月15号”“9月20日”这样的中文日期，"
                 "请正确转换成对应年份的 YYYY-MM-DD。\n"
-                "当前年份是 2026 年。\n\n"
-
-                "必须严格返回 JSON，不要输出其他内容。\n"
-                "格式如下：\n"
-                '{"city":"","start_date":"","days":0,"is_travel_request":false,"travel_intent":"chat"}'
+                f"当前日期是 {today.isoformat()}（{today.year} 年）。\n"
+                "请根据当前日期推断用户说的“9月15号”具体是哪一年，输出 YYYY-MM-DD。\n"
+                "如果用户说的日期已经过去，也请原样返回该日期，"
+                "不要自行顺延到明年，系统会统一提示用户。\n\n"
             )
         ),
         HumanMessage(
             content=state["messages"][-1].content
         )
     ])
+    response = raw_result.get("parsed")
 
-    response_data=json.loads(response.content)
-    response = TravelInfo(**response_data)
+    if isinstance(response, dict):
+        response = TravelInfo(**response)
+
+    if response is None:
+        # 模型没按 schema 输出时不崩，降级成普通聊天
+        print("结构化输出解析失败:", raw_result.get("parsing_error"))
+        response = TravelInfo(is_travel_request=False, travel_intent="chat")
 
     print("===== Planner =====")
     print(response)
 
-    if response.travel_intent == "new":
-        # 全新计划：不继承上一轮的信息
-        city, start_date, days = "", "", 0
-    else:
-        # 补充/修改：以旧值为底，新值覆盖
-        city, start_date, days = old_city, old_start_date, old_days
+    city, start_date, days, date_error = merge_travel_info(
+        old_city,
+        old_start_date,
+        old_days,
+        response,
+        today,
+    )
 
-    if response.city:
-        city = response.city
-
-    if response.start_date:
-        start_date = response.start_date
-
-    if response.days > 0:
-        days = response.days
-
-        # 关键：plan 必须用“合并后”的值，否则 synthesizer 拿到的是空字段
+    # 关键：plan 必须用“合并后”的值，否则 synthesizer 拿到的是空字段
     plan_info = TravelInfo(
         city=city,
         start_date=start_date,
@@ -316,6 +562,8 @@ def planner(state: State):
         "weather": "",
         "attractions": "",
         "tool_rounds": 0,
+        "date_error": date_error,
+        "itinerary": {},
     }
 # =========================
 # 检查旅行需求是否完整
@@ -354,15 +602,31 @@ def normal_chat(state: State):
             )
         )
     ]
-    messages.extend(state["messages"])
+    messages.extend(recent_messages(state["messages"], HISTORY_TURNS))
 
     response = model.invoke(messages)
 
+    content = response.content
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict)
+        )
+
+    if not content:
+        print("normal_chat 返回空内容")
+        print("content =", repr(content))
+        print("additional_kwargs =", response.additional_kwargs)
+        print("response_metadata =", response.response_metadata)
+        print("usage_metadata =", getattr(response, "usage_metadata", None))
+        content = "抱歉，这次模型没有返回内容，请再问一次。"
+
     return {
-        "normal_reply": response.content,
+        "normal_reply": content,
         # 关键：把模型自己的回复写回 messages，
         # 下一轮 normal_chat / planner 才看得到“我上一轮说了什么”
-        "messages": [response],
+        "messages": [AIMessage(content=content)],
     }
 # =========================
 #  请求用户补充信息
@@ -375,7 +639,12 @@ def ask_user(state:State):
         missing.append("开始日期")
     if  state["days"]<=0:
         missing.append("旅行天数")
-    message="为了帮您制定旅行计划，还需要提供：\n"
+
+    prefix = ""
+    if state.get("date_error"):
+        prefix = state["date_error"] + "\n\n"
+
+    message = prefix + "为了帮您制定旅行计划，还需要提供：\n"
     for item in missing:
         message+=f"- {item}\n"
     return {
@@ -445,6 +714,40 @@ def save_tool_results(state: State):
         "weather": weather,
         "attractions": attractions,
         "tool_rounds": rounds,
+    }
+def after_tools_router(state: State):
+    # 天气和景点都拿到了，直接去写攻略，不必再绕一次 executor
+    if state.get("weather") and state.get("attractions"):
+        return "synthesizer"
+    return "executor"
+
+
+def ensure_travel_data(state: State):
+    """兜底：模型这轮没调工具时，直接用 State 里的参数补查。"""
+    weather = state.get("weather") or ""
+    attractions = state.get("attractions") or ""
+
+    if not weather and state.get("city") and state.get("start_date") and state.get("days"):
+        print("===== Ensure Travel Data: 补查天气 =====")
+        try:
+            weather = get_weather.invoke({
+                "city": state["city"],
+                "start_date": state["start_date"],
+                "days": state["days"],
+            })
+        except Exception as exc:
+            weather = f"天气查询失败：{exc}"
+
+    if not attractions and state.get("city"):
+        print("===== Ensure Travel Data: 补查景点 =====")
+        try:
+            attractions = search_attractions.invoke({"city": state["city"]})
+        except Exception as exc:
+            attractions = f"景点查询失败：{exc}"
+
+    return {
+        "weather": weather,
+        "attractions": attractions,
     }
 def update_travel(state: State):
     print("===== Update Travel =====")
@@ -523,7 +826,7 @@ def executor(state: State):
 
     # 只保留 system + 完整对话历史（plan 已经在 system 里）
     messages = [SystemMessage(content=system_content)]
-    messages.extend(state["messages"])
+    messages.extend(recent_messages(state["messages"], HISTORY_TURNS))
 
     llm = model_with_tools if use_tools else model
 
@@ -549,11 +852,12 @@ def synthesizer(state: State):
     print("================================")
     print("===== Synthesizer 开始执行 =====")
     print("================================")
-    response = model.invoke([
+    t0 = time.perf_counter()
+    response = guide_model.invoke([
         SystemMessage(
             content=(
                 "你是一个旅行攻略编辑。\n"
-                "请根据旅行计划、天气信息、景点查询结果和执行结果，"
+                "请根据旅行计划、天气信息、景点查询结果，"
                 "整理成清晰、简洁、实用的最终旅行攻略。\n\n"
 
                 "【非常重要的规则】\n"
@@ -567,6 +871,11 @@ def synthesizer(state: State):
                 "8. 不要编造天气信息。\n"
                 "9. 如果查询到的景点数量不足以安排完整行程，"
                 "可以安排自由活动，但不要自行创造新的景点。\n"
+                "10. 总字数控制在 600 字以内。\n"
+                "11. 按天列点，每天最多 3 个安排，每个安排一句话。\n"
+                "12. 不要重复粘贴天气原始数据，只在必要时提一句温度。\n"
+                "13. 不要写开场白和总结语，直接给行程。\n"
+                "14. 如果天气信息为空或显示查询失败，明确说明天气暂缺，不要编造。\n"
             )
         ),
         HumanMessage(
@@ -579,11 +888,13 @@ def synthesizer(state: State):
 
                 f"【景点查询结果】\n"
                 f"{state['attractions']}\n\n"
-                f"【执行结果】\n"
-                f"{state['results']}"
             )
         )
     ])
+    print(
+        f"[timing] synthesizer: {time.perf_counter() - t0:.1f}s  "
+        f"usage={response.usage_metadata}"
+    )
     print("===== Synthesizer 生成结果 =====")
     print(response.content)
     return {
@@ -591,6 +902,153 @@ def synthesizer(state: State):
         # 最终攻略写回 messages：用户的下一句追问才能引用它
         "messages": [response],
     }
+
+
+# =========================
+# Structurer：把攻略转成结构化行程
+# =========================
+
+def regenerate_day(city, date, weekday, weather, attractions, current_day, instruction=""):
+    """只重写行程中的某一天，返回 DayPlan 的 dict。"""
+    raw = structured_day.invoke([
+        SystemMessage(
+            content=(
+                "你是行程编辑助手。请只重写指定这一天的安排。\n"
+                "要求：\n"
+                "1. 日期、星期、天气保持不变，不要修改。\n"
+                "2. 只能使用给定景点列表里的景点，不要新增。\n"
+                "3. items 按上午/下午/晚上排列，time 只写“上午/下午/晚上”。\n"
+                "4. 用户的要求：" + (instruction or "保持原样，只做轻微优化") + "\n"
+                "5. 不要输出与这一天无关的内容。\n"
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"【城市】{city}\n"
+                f"【日期】{date}（{weekday}）\n"
+                f"【天气】{weather}\n"
+                f"【可用景点】\n{attractions}\n\n"
+                f"【当前这一天】\n"
+                f"{json.dumps(current_day, ensure_ascii=False, indent=2)}"
+            )
+        ),
+    ])
+
+    day = raw.get("parsed")
+    if day is None:
+        print("单日重排解析失败:", raw.get("parsing_error"))
+        return None
+
+    if not isinstance(day, dict):
+        day = day.model_dump()
+
+    # 日期/星期/天气以当前卡片为准，避免模型改写
+    day["date"] = date
+    day["weekday"] = weekday
+    day["weather"] = weather
+
+    for item in day.get("items", []):
+        item["travel_from_previous"] = ""
+
+    return normalize_temps(day)
+
+
+def structurer(state: State):
+    print("===== Structurer =====")
+    raw = structured_itinerary.invoke([
+        SystemMessage(
+            content=(
+                "你是一个行程结构化助手。请把旅行攻略整理成结构化行程。\n"
+                "要求：\n"
+                "1. 每一天对应一个 DayPlan，date 用 YYYY-MM-DD。\n"
+                "2. items 按上午/下午/晚上排列，time 只写“上午/下午/晚上”。\n"
+                "3. weather 只写当天的天气和温度，不要编造。\n"
+                "4. tips 是通用提醒，最多 5 条。\n"
+                "5. 不要添加攻略里没有的景点。\n"
+                "6. 如果攻略明确说天气暂缺，weather 写“天气暂缺”。\n"
+                "7. weather 和 summary 里的温度统一写成“最低°C ~ 最高°C”，不要漏掉 ~。\n"
+                "8. budget 是参考预算，只给区间，不要精确金额。\n"
+                "9. budget.per_person 和 budget.total 只写数字区间，例如“1200~1800”，不要带“元”。\n"
+                "10. budget.items 至少包含交通、门票、餐饮、住宿四类，amount 也只写区间。\n"
+                "11. budget.note 固定写“参考价，按 2 人估算，以实际为准”。\n"
+                "12. budget.items 的 amount 是人均金额；per_person 是四项之和，total 是 per_person 的 2 倍。\n"
+            )
+        ),
+        HumanMessage(
+            content=(
+                f"【旅行计划】\n{state['plan']}\n\n"
+                f"【天气信息】\n{state['weather']}\n\n"
+                f"【景点查询结果】\n{state['attractions']}\n\n"
+                f"【攻略正文】\n{state['results']}"
+            )
+        ),
+    ])
+
+    itinerary = raw.get("parsed")
+
+    if itinerary is None:
+        print("结构化行程解析失败:", raw.get("parsing_error"))
+        return {"itinerary": {}}
+
+    data = itinerary if isinstance(itinerary, dict) else itinerary.model_dump()
+
+    if data.get("budget"):
+        data["budget"] = normalize_budget(data["budget"])
+
+    # 车程由 route_enricher 统一计算，先清掉模型可能编的值
+    for day in data.get("day_plans", []):
+        for item in day.get("items", []):
+            item["travel_from_previous"] = ""
+
+    return {"itinerary": normalize_temps(data)}
+
+
+# =========================
+# Route Enricher：计算景点之间的车程
+# =========================
+
+def route_enricher(state: State):
+    itinerary = state.get("itinerary") or {}
+    day_plans = itinerary.get("day_plans") or []
+
+    if not AMAP_API_KEY or not day_plans:
+        return {"itinerary": itinerary}
+
+    city = itinerary.get("city") or state.get("city") or ""
+    updated_days = []
+
+    for day in day_plans:
+        items = [dict(item) for item in (day.get("items") or [])]
+
+        last_location = None
+
+        for item in items:
+            title = item.get("title", "")
+
+            # “自由活动/返程/用餐”不是具体景点，不参与车程计算
+            if _is_generic_title(title):
+                item["travel_from_previous"] = ""
+                continue
+
+            location = _lookup_location(title, city)
+
+            if last_location and location:
+                item["travel_from_previous"] = _driving_info(
+                    last_location, location
+                )
+            else:
+                item["travel_from_previous"] = ""
+
+            if location:
+                last_location = location
+
+        day = dict(day)
+        day["items"] = items
+        updated_days.append(day)
+
+    updated = dict(itinerary)
+    updated["day_plans"] = updated_days
+    return {"itinerary": updated}
 
 
 # =========================
@@ -604,6 +1062,9 @@ graph.add_node("check_requirements", check_requirements)
 graph.add_node("ask_user", ask_user)
 graph.add_node("executor", executor)
 graph.add_node("synthesizer", synthesizer)
+graph.add_node("structurer", structurer)
+graph.add_node("route_enricher", route_enricher)
+graph.add_node("ensure_travel_data", ensure_travel_data)
 graph.add_node("tools", tool_node)
 graph.add_node("save_tool_results", save_tool_results)
 graph.add_node("normal_chat",normal_chat)
@@ -632,18 +1093,34 @@ graph.add_conditional_edges(
     executor_router,
     {
         "tools": "tools",
-        "synthesizer": "synthesizer"
+        "synthesizer": "ensure_travel_data"
     }
 )
 
 
 graph.add_edge("tools", "save_tool_results")
-graph.add_edge("save_tool_results", "executor")
-graph.add_edge("synthesizer", END)
+graph.add_conditional_edges(
+    "save_tool_results",
+    after_tools_router,
+    {
+        "synthesizer": "synthesizer",
+        "executor": "executor",
+    },
+)
+graph.add_edge("synthesizer", "structurer")
+graph.add_edge("structurer", "route_enricher")
+graph.add_edge("route_enricher", END)
+graph.add_edge("ensure_travel_data", "synthesizer")
 graph.add_edge("normal_chat",END)
 # =========================
 # 8. 编译
 # =========================
-memory=MemorySaver()
+DB_PATH = os.getenv("CHECKPOINT_DB", "checkpoints.sqlite")
+
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.execute("PRAGMA journal_mode=WAL;")
+
+memory = SqliteSaver(conn)
+memory.setup()
 
 app = graph.compile(checkpointer=memory)

@@ -1,0 +1,13 @@
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-dotenv==1.2.3
+requests==2.34.2
+pydantic==2.13.5
+
+langchain==1.4.0
+langchain-core==1.6.2
+langchain-deepseek==1.1.0
+langgraph==1.2.11
+langgraph-prebuilt==1.1.0
+langgraph-checkpoint==4.3.1
+langgraph-checkpoint-sqlite==3.1.2
